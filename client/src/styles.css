@@ -389,7 +389,8 @@ button:disabled {
 }
 
 .thinking-panel,
-.avatar-details {
+.avatar-details,
+.thinking-preview {
   margin-bottom: 10px;
   padding: 10px 12px;
   border-radius: 14px;
@@ -398,15 +399,119 @@ button:disabled {
 }
 
 .thinking-panel strong,
-.avatar-details strong {
+.avatar-details strong,
+.thinking-preview strong {
   display: block;
   margin-bottom: 6px;
   color: var(--text);
   font-size: 12px;
 }
 
+.review-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border-radius: 14px;
+  font-size: 12px;
+}
+
+.review-strip strong {
+  color: var(--text);
+}
+
+.review-strip.approved {
+  background: rgba(124, 139, 107, 0.12);
+  color: #4d5e43;
+}
+
+.review-strip.rejected {
+  background: rgba(201, 111, 74, 0.12);
+  color: #9a4c31;
+}
+
+.tool-card {
+  margin-bottom: 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(255, 250, 244, 0.82);
+  border: 1px solid rgba(90, 59, 46, 0.1);
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.tool-card strong {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text);
+}
+
+.tool-card p {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.tool-card p + p {
+  margin-top: 4px;
+}
+
+.chain-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-pill);
+  background: rgba(124, 139, 107, 0.08);
+  border: 1px solid rgba(110, 90, 77, 0.12);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.handoff-strip {
+  margin-top: 10px;
+  margin-bottom: 0;
+}
+
+.chain-label {
+  color: var(--accent-espresso);
+  font-weight: 600;
+}
+
+.chain-nodes,
+.chain-flow {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.chain-node {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.58);
+  color: var(--text);
+}
+
+.chain-node.muted,
+.chain-arrow,
+.chain-reason {
+  color: var(--text-muted);
+}
+
+.chain-reason {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
 .thinking-panel pre,
-.avatar-details p {
+.avatar-details p,
+.thinking-preview p {
   margin: 0;
   white-space: pre-wrap;
   word-break: break-word;

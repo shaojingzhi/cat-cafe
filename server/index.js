@@ -10,8 +10,9 @@ const { configureGlobalProxy } = require('./lib/network')
 const { ensureAvatarStorage, loadAvatarMeta, saveAgentAvatar, writeAvatarImage, downloadAvatarImage, avatarImageDir } = require('./lib/avatar-store')
 const { generateAvatarImage, IMAGE_BASE_URL, IMAGE_MODEL } = require('./lib/images')
 const { createAgentReply, describeRuntimeStrategy } = require('./runtime/chat-runtime')
-const { nextAgentHandoff } = require('./runtime/a2a-routing')
+const { nextAgentHandoff, resolveInitialTargets } = require('./runtime/a2a-routing')
 const { handleAvatarDesignFlow, shouldHandleAvatarDesign } = require('./runtime/avatar-workflow')
+const { handleCodeFixFlow, shouldHandleCodeFix } = require('./runtime/code-fix-workflow')
 
 const app = express()
 app.use(cors())
@@ -200,7 +201,7 @@ app.get('/api/threads/:threadId/messages', (req, res) => {
   res.json(state.messagesByThread[req.params.threadId] || [])
 })
 
-app.post('/api/threads/:threadId/messages', (req, res) => {
+app.post('/api/threads/:threadId/messages', async (req, res) => {
   const { threadId } = req.params
   const content = String(req.body?.content || '').trim()
 
@@ -218,12 +219,29 @@ app.post('/api/threads/:threadId/messages', (req, res) => {
     content,
   })
 
-  const targets = resolveTargets(content)
+  const dispatch = await resolveInitialTargets({
+    content,
+    agents: AGENTS,
+    threadMessages: state.messagesByThread[threadId] || [],
+    generateAgentReply,
+  })
+
+  updateMessage(threadId, userMessage.id, {
+    meta: {
+      dispatch: dispatch.meta,
+    },
+  })
+
+  const targets = dispatch.targets
   targets.forEach((agent) => {
     runAgentFlow({ threadId, agent, task: content, parentMessageId: userMessage.id, depth: 0 })
   })
 
-  res.status(202).json({ ok: true, queuedAgents: targets.map((agent) => agent.name) })
+  res.status(202).json({
+    ok: true,
+    queuedAgents: targets.map((agent) => agent.name),
+    dispatch: dispatch.meta,
+  })
 })
 
 const server = app.listen(PORT, () => {
@@ -232,7 +250,27 @@ const server = app.listen(PORT, () => {
 
 wss = new WebSocketServer({ server })
 
-wss.on('connection', (socket) => {
+// Basic WS observability + heartbeat to avoid silent disconnects.
+// This helps users distinguish: "WS not connected" vs "LLM/provider failed".
+const WS_HEARTBEAT_MS = Number(process.env.WS_HEARTBEAT_MS || 25000)
+
+function heartbeat() {
+  this.isAlive = true
+}
+
+wss.on('connection', (socket, req) => {
+  socket.isAlive = true
+  socket.on('pong', heartbeat)
+  socket.on('error', (error) => {
+    console.warn('[ws] socket error:', error.message)
+  })
+  socket.on('close', (code, reason) => {
+    console.log('[ws] socket closed:', code, reason ? reason.toString() : '')
+  })
+
+  const ip = req?.socket?.remoteAddress
+  console.log('[ws] connected:', { ip })
+
   socket.send(
     JSON.stringify({
       type: 'snapshot',
@@ -244,6 +282,30 @@ wss.on('connection', (socket) => {
       },
     }),
   )
+})
+
+const wsHeartbeat = setInterval(() => {
+  for (const socket of wss.clients) {
+    if (socket.isAlive === false) {
+      try {
+        socket.terminate()
+      } catch {
+        // ignore
+      }
+      continue
+    }
+
+    socket.isAlive = false
+    try {
+      socket.ping()
+    } catch {
+      // ignore
+    }
+  }
+}, WS_HEARTBEAT_MS)
+
+wss.on('close', () => {
+  clearInterval(wsHeartbeat)
 })
 
 function createThread(title) {
@@ -289,6 +351,8 @@ function updateMessage(threadId, messageId, patch) {
           patch.meta.thinking === null || patch.meta.thinking === undefined
             ? previous.meta?.thinking || null
             : patch.meta.thinking,
+        dispatch: patch.meta.dispatch ? patch.meta.dispatch : previous.meta?.dispatch,
+        handoff: patch.meta.handoff ? patch.meta.handoff : previous.meta?.handoff,
       }
     : previous.meta
 
@@ -300,15 +364,6 @@ function updateMessage(threadId, messageId, patch) {
 
   broadcast('message_updated', { threadId, message: list[index] })
   return list[index]
-}
-
-function resolveTargets(content) {
-  const targets = AGENTS.filter((agent) => {
-    const names = [agent.name, ...agent.aliases]
-    return names.some((name) => content.includes(`@${name}`))
-  })
-
-  return targets.length > 0 ? targets : [AGENTS[0]]
 }
 
 function setAgentStatus(agentId, status) {
@@ -375,6 +430,29 @@ async function runAgentFlow({ threadId, agent, task, parentMessageId, depth }) {
     return
   }
 
+  if (shouldHandleCodeFix({ agent, task })) {
+    const reply = await handleCodeFixFlow({
+      state,
+      threadId,
+      agent,
+      task,
+      messageId: liveMessage.id,
+      updateMessage,
+      generateAgentReply,
+    })
+
+    updateMessage(threadId, liveMessage.id, {
+      content: reply.text,
+      meta: {
+        ...reply.meta,
+        streaming: false,
+      },
+    })
+
+    setAgentStatus(agent.id, 'idle')
+    return
+  }
+
   setAgentStatus(agent.id, 'replying')
   await wait(100)
 
@@ -397,15 +475,41 @@ async function runAgentFlow({ threadId, agent, task, parentMessageId, depth }) {
 
   setAgentStatus(agent.id, 'idle')
 
-  const handoff = nextAgentHandoff({ agent, task, depth, agents: AGENTS })
+  const handoff = await nextAgentHandoff({
+    agent,
+    task,
+    depth,
+    agents: AGENTS,
+    threadMessages: state.messagesByThread[threadId] || [],
+    replyText: reply.text,
+    generateAgentReply,
+    parentMessageId,
+  })
   if (!handoff) return
 
   const handoffTask = `${agent.name} 请求 ${handoff.name} 协作：${handoff.instruction}`
   const handoffMessage = addMessage(threadId, {
     authorType: 'system',
     authorName: 'A2A 路由',
-    content: `${agent.name} -> @${handoff.name} ${handoff.instruction}`,
+    content: `${agent.name} 想请 @${handoff.name} 一起处理：${handoff.instruction}`,
     parentMessageId,
+    meta: {
+      delivery: 'a2a-handoff',
+      provider: agent.provider,
+      model: agent.model,
+      viaFallback: false,
+      thinking: null,
+      errors: null,
+      handoff: {
+        routeType: handoff.routeType || 'unknown',
+        reason: handoff.reason || null,
+        expectedOutput: handoff.expectedOutput || null,
+        urgency: handoff.urgency || null,
+        confidence: handoff.confidence ?? null,
+        fromAgentId: agent.id,
+        toAgentId: handoff.id,
+      },
+    },
   })
 
   runAgentFlow({

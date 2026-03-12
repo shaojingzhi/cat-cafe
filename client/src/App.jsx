@@ -3,7 +3,41 @@ import { useEffect, useMemo, useState } from 'react'
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:3001'
 const WS_BASE = import.meta.env.VITE_WS_BASE || 'ws://localhost:3001'
 
+function resolveApiBase(input) {
+  const raw = String(input || '').trim()
+  if (!raw) return ''
+  if (raw.startsWith('http://') || raw.startsWith('https://')) return raw.replace(/\/$/, '')
+  // allow relative like "/" "/api" etc
+  if (raw.startsWith('/')) return raw.replace(/\/$/, '')
+  return raw.replace(/\/$/, '')
+}
+
+function resolveWsUrl(input) {
+  const raw = String(input || '').trim()
+  if (!raw) return ''
+
+  // Already a ws(s) URL
+  if (raw.startsWith('ws://') || raw.startsWith('wss://')) return raw
+
+  // If given http(s), convert to ws(s)
+  if (raw.startsWith('http://') || raw.startsWith('https://')) {
+    return raw.replace(/^http/, 'ws').replace(/\/$/, '')
+  }
+
+  // Relative path: derive from current location (supports reverse proxy)
+  if (raw.startsWith('/')) {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    return `${protocol}//${window.location.host}${raw}`
+  }
+
+  // Fallback: treat as host:port
+  const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://'
+  return `${protocol}${raw}`
+}
+
 function App() {
+  const resolvedApiBase = useMemo(() => resolveApiBase(API_BASE), [])
+  const resolvedWsUrl = useMemo(() => resolveWsUrl(WS_BASE), [])
   const [threads, setThreads] = useState([])
   const [activeThreadId, setActiveThreadId] = useState('')
   const [messagesByThread, setMessagesByThread] = useState({})
@@ -13,7 +47,7 @@ function App() {
   const [draft, setDraft] = useState('@布偶猫 规划下一步功能；@缅因猫 review 风险；@暹罗猫 补充页面体验建议。')
   const [isSending, setIsSending] = useState(false)
   const [avatarLoadingId, setAvatarLoadingId] = useState('')
-  const [openThinkingIds, setOpenThinkingIds] = useState({})
+  const [thinkingPrefs, setThinkingPrefs] = useState({})
   const [openAvatarIds, setOpenAvatarIds] = useState({})
 
   const activeMessages = useMemo(() => messagesByThread[activeThreadId] || [], [activeThreadId, messagesByThread])
@@ -30,68 +64,126 @@ function App() {
   }, [activeThreadId])
 
   useEffect(() => {
-    const socket = new WebSocket(`${WS_BASE}`)
+    let socket
+    let retryTimer = null
+    let retryCount = 0
+    let closedByCleanup = false
 
-    socket.onmessage = (event) => {
-      const data = JSON.parse(event.data)
+    function connect() {
+      socket = new WebSocket(resolvedWsUrl)
 
-      if (data.type === 'snapshot') {
-        setThreads(data.payload.threads)
-        setAgentStatuses(data.payload.agentStatuses)
-        setMessagesByThread(data.payload.messagesByThread)
-        setUserProfile(data.payload.userProfile || null)
+      socket.onopen = () => {
+        retryCount = 0
+        // eslint-disable-next-line no-console
+        console.log('[ws] connected', resolvedWsUrl)
+      }
 
-        if (!activeThreadId && data.payload.threads[0]) {
-          setActiveThreadId(data.payload.threads[0].id)
+      socket.onerror = (event) => {
+        // eslint-disable-next-line no-console
+        console.warn('[ws] error', event)
+      }
+
+      socket.onclose = (event) => {
+        // eslint-disable-next-line no-console
+        console.warn('[ws] closed', { code: event.code, reason: event.reason })
+        if (closedByCleanup) return
+
+        const base = 600
+        const cap = 8000
+        const delay = Math.min(cap, base * Math.pow(2, Math.min(5, retryCount)))
+        retryCount += 1
+
+        clearTimeout(retryTimer)
+        retryTimer = setTimeout(() => {
+          connect()
+        }, delay)
+      }
+
+      socket.onmessage = (event) => {
+        const data = JSON.parse(event.data)
+
+        if (data.type === 'snapshot') {
+          setThreads(data.payload.threads)
+          setAgentStatuses(data.payload.agentStatuses)
+          setMessagesByThread(data.payload.messagesByThread)
+          setUserProfile(data.payload.userProfile || null)
+
+          if (!activeThreadId && data.payload.threads[0]) {
+            setActiveThreadId(data.payload.threads[0].id)
+          }
         }
-      }
 
-      if (data.type === 'thread_created') {
-        setThreads((current) => [data.payload, ...current.filter((item) => item.id !== data.payload.id)])
-        setActiveThreadId(data.payload.id)
-      }
-
-      if (data.type === 'message_created') {
-        setMessagesByThread((current) => ({
-          ...current,
-          [data.payload.threadId]: [...(current[data.payload.threadId] || []), data.payload.message],
-        }))
-      }
-
-      if (data.type === 'message_updated') {
-        if (data.payload.message.meta?.thinking) {
-          setOpenThinkingIds((current) => {
-            if (current[data.payload.message.id] !== undefined) return current
-            return { ...current, [data.payload.message.id]: true }
-          })
+        if (data.type === 'thread_created') {
+          setThreads((current) => [data.payload, ...current.filter((item) => item.id !== data.payload.id)])
+          setActiveThreadId(data.payload.id)
         }
 
-        setMessagesByThread((current) => ({
-          ...current,
-          [data.payload.threadId]: (current[data.payload.threadId] || []).map((message) =>
-            message.id === data.payload.message.id ? data.payload.message : message,
-          ),
-        }))
-      }
+        if (data.type === 'message_created') {
+          setMessagesByThread((current) => ({
+            ...current,
+            [data.payload.threadId]: [...(current[data.payload.threadId] || []), data.payload.message],
+          }))
+        }
 
-      if (data.type === 'agent_statuses') {
-        setAgentStatuses(data.payload)
-      }
+        if (data.type === 'message_updated') {
+          if (data.payload.message.meta?.thinking) {
+            setThinkingPrefs((current) => {
+              const existing = current[data.payload.message.id]
+              const shouldOpen = shouldOpenThinkingByDefault(data.payload.message)
 
-      if (data.type === 'user_profile') {
-        setUserProfile(data.payload)
+              if (!existing) {
+                return {
+                  ...current,
+                  [data.payload.message.id]: { open: shouldOpen, manual: false },
+                }
+              }
+
+              if (existing.manual) return current
+
+              return {
+                ...current,
+                [data.payload.message.id]: { open: shouldOpen, manual: false },
+              }
+            })
+          }
+
+          setMessagesByThread((current) => ({
+            ...current,
+            [data.payload.threadId]: (current[data.payload.threadId] || []).map((message) =>
+              message.id === data.payload.message.id ? data.payload.message : message,
+            ),
+          }))
+        }
+
+        if (data.type === 'agent_statuses') {
+          setAgentStatuses(data.payload)
+        }
+
+        if (data.type === 'user_profile') {
+          setUserProfile(data.payload)
+        }
       }
     }
 
-    return () => socket.close()
-  }, [activeThreadId])
+    connect()
+
+    return () => {
+      closedByCleanup = true
+      clearTimeout(retryTimer)
+      try {
+        socket?.close()
+      } catch {
+        // ignore
+      }
+    }
+  }, [resolvedWsUrl])
 
   async function bootstrap() {
     const [threadsResponse, statusResponse, providerResponse, profileResponse] = await Promise.all([
-      fetch(`${API_BASE}/api/threads`),
-      fetch(`${API_BASE}/api/agents`),
-      fetch(`${API_BASE}/api/providers`),
-      fetch(`${API_BASE}/api/profile`),
+      fetch(`${resolvedApiBase}/api/threads`),
+      fetch(`${resolvedApiBase}/api/agents`),
+      fetch(`${resolvedApiBase}/api/providers`),
+      fetch(`${resolvedApiBase}/api/profile`),
     ])
 
     const threadList = await threadsResponse.json()
@@ -113,13 +205,13 @@ function App() {
   }
 
   async function loadMessages(threadId) {
-    const response = await fetch(`${API_BASE}/api/threads/${threadId}/messages`)
+    const response = await fetch(`${resolvedApiBase}/api/threads/${threadId}/messages`)
     const threadMessages = await response.json()
     setMessagesByThread((current) => ({ ...current, [threadId]: threadMessages }))
   }
 
   async function createThread() {
-    const response = await fetch(`${API_BASE}/api/threads`, {
+    const response = await fetch(`${resolvedApiBase}/api/threads`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: `今日茶话会 ${threads.length + 1}` }),
@@ -135,7 +227,7 @@ function App() {
     setIsSending(true)
 
     try {
-      await fetch(`${API_BASE}/api/threads/${activeThreadId}/messages`, {
+      await fetch(`${resolvedApiBase}/api/threads/${activeThreadId}/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content: draft.trim() }),
@@ -148,7 +240,7 @@ function App() {
 
   async function sendQuickMessage(content) {
     if (!activeThreadId || !content.trim()) return
-    await fetch(`${API_BASE}/api/threads/${activeThreadId}/messages`, {
+    await fetch(`${resolvedApiBase}/api/threads/${activeThreadId}/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content }),
@@ -158,7 +250,7 @@ function App() {
   async function generateAvatar(agentId) {
     setAvatarLoadingId(agentId)
     try {
-      const response = await fetch(`${API_BASE}/api/agents/${agentId}/avatar/generate`, {
+      const response = await fetch(`${resolvedApiBase}/api/agents/${agentId}/avatar/generate`, {
         method: 'POST',
       })
 
@@ -167,7 +259,7 @@ function App() {
         throw new Error(error.error || '头像生成失败')
       }
 
-      const agentsResponse = await fetch(`${API_BASE}/api/agents`)
+      const agentsResponse = await fetch(`${resolvedApiBase}/api/agents`)
       setAgentStatuses(await agentsResponse.json())
     } finally {
       setAvatarLoadingId('')
@@ -179,7 +271,13 @@ function App() {
   }
 
   function toggleThinking(messageId) {
-    setOpenThinkingIds((current) => ({ ...current, [messageId]: !current[messageId] }))
+    setThinkingPrefs((current) => {
+      const existing = current[messageId] || { open: false, manual: false }
+      return {
+        ...current,
+        [messageId]: { open: !existing.open, manual: true },
+      }
+    })
   }
 
   function toggleAvatarDetails(agentId) {
@@ -250,7 +348,7 @@ function App() {
                   <article className={`message ${message.authorType}`} key={message.id}>
                     <div className="message-avatar-wrap">
                       <div className={`avatar medallion ${actor?.accent || agent?.accent || 'neutral'}`}>
-                        {renderAvatar(actor || agent, message.authorType, API_BASE)}
+                        {renderAvatar(actor || agent, message.authorType, resolvedApiBase)}
                       </div>
                     </div>
                     <div className="message-body">
@@ -273,7 +371,7 @@ function App() {
                           ) : null}
                           {message.meta.thinking ? (
                             <button className="tiny-toggle" onClick={() => toggleThinking(message.id)}>
-                              {openThinkingIds[message.id] ? '收起思考' : '查看思考'}
+                              {isThinkingOpen(message.id, thinkingPrefs) ? '收起思考' : '展开思考'}
                             </button>
                           ) : null}
                           {message.meta.actions?.includes('confirm-avatar') ? (
@@ -283,13 +381,28 @@ function App() {
                           ) : null}
                         </div>
                       ) : null}
-                      {message.meta?.thinking && openThinkingIds[message.id] ? (
+                      {message.meta?.dispatch ? <DispatchStrip dispatch={message.meta.dispatch} /> : null}
+                      {message.meta?.thinking && !isThinkingOpen(message.id, thinkingPrefs) ? (
+                        <div className="thinking-preview">
+                          <strong>思考摘要</strong>
+                          <p>{summarizeThinking(message.meta.thinking)}</p>
+                        </div>
+                      ) : null}
+                      {message.meta?.thinking && isThinkingOpen(message.id, thinkingPrefs) ? (
                         <div className="thinking-panel">
                           <strong>思考过程</strong>
                           <pre>{message.meta.thinking}</pre>
                         </div>
                       ) : null}
+                      {message.meta?.toolExecution?.review ? (
+                        <div className={`review-strip ${message.meta.toolExecution.review.verdict}`}>
+                          <strong>缅因猫 review</strong>
+                          <span>{message.meta.toolExecution.review.summary || message.meta.toolExecution.review.reason}</span>
+                        </div>
+                      ) : null}
+                      {message.meta?.toolExecution ? <ToolExecutionCard toolExecution={message.meta.toolExecution} /> : null}
                       <p>{message.content}</p>
+                      {message.meta?.handoff ? <HandoffStrip handoff={message.meta.handoff} agents={agentStatuses} /> : null}
                     </div>
                   </article>
                 )
@@ -340,7 +453,7 @@ function App() {
               <section className={`roster-card ${userProfile.accent || 'neutral'}`} key={userProfile.id}>
                 <div className="roster-top">
                   <div className={`avatar portrait ${userProfile.accent || 'neutral'}`}>
-                    {renderAvatar(userProfile, 'user', API_BASE)}
+                    {renderAvatar(userProfile, 'user', resolvedApiBase)}
                   </div>
                   <div>
                     <h3>{userProfile.name}</h3>
@@ -379,7 +492,7 @@ function App() {
                 <section className={`roster-card ${agent.accent || 'amber'}`} key={agent.id}>
                   <div className="roster-top">
                     <div className={`avatar portrait ${agent.accent || 'amber'}`}>
-                      {renderAvatar(agent, 'agent', API_BASE)}
+                      {renderAvatar(agent, 'agent', resolvedApiBase)}
                     </div>
                     <div>
                       <h3>{agent.name}</h3>
@@ -447,8 +560,82 @@ function Metric({ label, value }) {
   )
 }
 
+function DispatchStrip({ dispatch }) {
+  const candidates = dispatch.candidates || []
+
+  return (
+    <div className="chain-strip dispatch-strip">
+      <span className="chain-label">已派给</span>
+      <div className="chain-nodes">
+        {candidates.slice(0, 2).map((candidate) => (
+          <span key={candidate.agentId} className="chain-node">
+            {agentNameFromId(candidate.agentId)}
+          </span>
+        ))}
+        {candidates.length > 2 ? <span className="chain-node muted">+{candidates.length - 2}</span> : null}
+      </div>
+      {dispatch.reasonSummary ? <span className="chain-reason">{dispatch.reasonSummary}</span> : null}
+    </div>
+  )
+}
+
+function HandoffStrip({ handoff, agents }) {
+  const fromName = agentNameFromId(handoff.fromAgentId, agents)
+  const toName = agentNameFromId(handoff.toAgentId, agents)
+
+  return (
+    <div className="chain-strip handoff-strip">
+      <span className="chain-label">继续交接</span>
+      <div className="chain-flow">
+        <span className="chain-node">{fromName}</span>
+        <span className="chain-arrow">{'->'}</span>
+        <span className="chain-node">{toName}</span>
+      </div>
+      {handoff.reason ? <span className="chain-reason">{handoff.reason}</span> : null}
+    </div>
+  )
+}
+
+function ToolExecutionCard({ toolExecution }) {
+  const lines = []
+
+  if (toolExecution.changedFiles?.length) {
+    lines.push(`已修改：${toolExecution.changedFiles.join('、')}`)
+  }
+
+  if (toolExecution.checkedFiles?.length) {
+    lines.push(`已校验：${toolExecution.checkedFiles.join('、')}`)
+  }
+
+  if (toolExecution.autoRetry) {
+    lines.push('状态：缅因猫给出反馈后已自动再修一轮')
+  }
+
+  if (lines.length === 0) return null
+
+  return (
+    <div className="tool-card">
+      <strong>修复结果</strong>
+      {lines.map((line) => (
+        <p key={line}>{line}</p>
+      ))}
+    </div>
+  )
+}
+
 function findAgentForMessage(message, agentStatuses) {
   return agentStatuses.find((agent) => agent.id === message.authorId || agent.name === message.authorName) || null
+}
+
+function agentNameFromId(agentId, agentStatuses = []) {
+  const builtins = {
+    ragdoll: '布偶猫',
+    maine: '缅因猫',
+    siamese: '暹罗猫',
+    caretaker: '铲屎官',
+  }
+
+  return agentStatuses.find((agent) => agent.id === agentId)?.name || builtins[agentId] || agentId
 }
 
 function iconForMessage(authorType) {
@@ -473,10 +660,32 @@ function labelForStatus(status) {
 }
 
 function deliveryLabel(delivery) {
+  if (delivery === 'tool-apply') return '代码修复'
   if (delivery === 'avatar-draft') return '头像草案'
   if (delivery === 'provider-fallback') return '备用模型'
   if (delivery === 'mock-fallback') return 'Mock 回退'
   return '真实调用'
+}
+
+function shouldOpenThinkingByDefault(message) {
+  if (!message?.meta?.thinking) return false
+  if (message.meta.streaming) return true
+  return !isLongThinking(message.meta.thinking)
+}
+
+function isLongThinking(thinking) {
+  const text = String(thinking || '')
+  return text.length > 280 || text.split('\n').length > 6
+}
+
+function summarizeThinking(thinking) {
+  const compact = String(thinking || '').replace(/\s+/g, ' ').trim()
+  if (compact.length <= 110) return compact
+  return `${compact.slice(0, 109)}...`
+}
+
+function isThinkingOpen(messageId, thinkingPrefs) {
+  return Boolean(thinkingPrefs[messageId]?.open)
 }
 
 export default App

@@ -70,6 +70,48 @@ React 前后分离的最小可行版多 Agent 协作工作台。
 
 ## 启动
 
+## “暹罗猫连不上”排查（优先看这里）
+
+### 连接链路说明
+
+- 前端：`client` 通过 `VITE_API_BASE` 调后端 HTTP（默认 `http://localhost:3001`）
+- 前端：`client` 通过 `VITE_WS_BASE` 连后端 WS（默认 `ws://localhost:3001`）用于实时状态/消息
+- 后端：`server/index.js` 提供 HTTP API + 复用同端口的 WebSocketServer（无额外鉴权）
+- 暹罗猫：provider 默认 Gemini（通常需要可用代理环境变量 `HTTPS_PROXY/HTTP_PROXY/ALL_PROXY` 才能稳定访问）
+
+当出现“暹罗猫连不上”时，常见其实是两类问题：
+
+1) WS 断开：UI 不再实时刷新，表现像“猫不工作/连不上”。
+2) Gemini 网络不可达：WS 正常，但暹罗猫调用 Gemini 超时/失败并回退 mock（需要看后端日志/dispatch meta）。
+
+### 可复现步骤与典型现象
+
+1. 不设置代理（或设置错误代理）：
+
+```bash
+unset HTTPS_PROXY HTTP_PROXY ALL_PROXY
+npm --prefix server run dev
+npm --prefix client run dev
+```
+
+2. 在输入框 `@暹罗猫 ...` 发消息。
+
+预期：
+- 后端 provider 调用可能失败（取决于你所在网络能否访问 Gemini）。
+- 前端控制台应看到 WS 连接日志：`[ws] connected ...`。若 WS 连不上，会看到 `[ws] closed ...` 并自动重连。
+
+### 最基本验证清单（修复后）
+
+- Healthcheck：
+  - `curl http://localhost:3001/api/health` 返回 `{ ok: true }`
+- WS 握手成功：
+  - 浏览器控制台出现 `[ws] connected ws://...`
+  - server 控制台出现 `[ws] connected: { ip: ... }`
+- WS 断开可重连：
+  - 手动停掉后端再启动，前端应在几秒内自动重连
+- 心跳参数：
+  - 可用 `WS_HEARTBEAT_MS=25000` 调整（默认 25s）
+
 ### 1. 安装依赖
 
 ```bash
