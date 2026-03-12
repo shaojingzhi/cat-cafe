@@ -1,0 +1,10 @@
+.env
+.memory/
+node_modules/
+client/node_modules/
+server/node_modules/
+client/dist/
+client/*.log
+server/*.log
+server/data/avatars/
+server/data/avatars.json

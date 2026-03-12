@@ -1,0 +1,54 @@
+我建议采用这条实现路径：
+
+方案
+
+前端
+
+React + Vite
+单页工作台界面
+包含：
+Thread 列表
+聊天区
+三只猫状态栏
+输入框，支持 @布偶猫 @缅因猫 @暹罗猫
+后端
+
+Node.js + Express
+WebSocket 推送实时状态
+先用内存存储做 MVP，不先上 Redis/数据库
+提供：
+thread/message API
+agent 路由器
+简单 A2A 调用链
+session/thread 基础隔离
+agent 状态机：idle / thinking / replying
+MVP 第一阶段功能
+
+创建/切换 thread
+用户发消息并 @ 指定猫
+多猫并行回复
+猫状态实时更新
+基础 A2A：一只猫可转发任务给另一只猫
+前后端跑通一条完整协作链
+先不做
+
+语音
+Rich Blocks
+PR / GitHub 闭环
+队列持久化 / Redis
+PWA
+真正接 Claude/Codex/Gemini CLI
+实现策略
+
+先做 可运行假 Agent 框架：
+
+用 mock agent adapter 模拟三只猫
+把路由、状态、thread、A2A 这些骨架先搭好
+后面再把 mock adapter 替换成真实 CLI adapter
+这样风险最低，也最符合教程里的演进思路。
+
+如果你确认，我下一步就开始：
+
+初始化前后端目录
+搭好基础架构
+先把 MVP 主流程跑通
